@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code
+.claude/
+
+# ii-to-wealthfolio: user-specific data — not for version control
+symbol-map.json
+output/
+done/
