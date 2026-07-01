@@ -22,3 +22,6 @@ OUTPUT_DIR = "output"
 
 # Symbol map — maps ii symbols/SEDOLs to Wealthfolio symbols.
 SYMBOL_MAP_PATH = "symbol-map.json"
+
+# Path to the Wealthfolio SQLite database (used to look up account names).
+WEALTHFOLIO_DB_PATH = r"~\AppData\Roaming\com.teymz.wealthfolio\app.db"

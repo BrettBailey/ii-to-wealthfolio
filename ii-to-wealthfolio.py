@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import urllib.request
 from datetime import datetime
@@ -50,6 +51,7 @@ INPUT_DIR = _resolve(config.INPUT_DIR)
 DONE_DIR = _resolve(config.DONE_DIR)
 OUTPUT_DIR = _resolve(config.OUTPUT_DIR)
 SYMBOL_MAP_PATH = _resolve(config.SYMBOL_MAP_PATH)
+WEALTHFOLIO_DB_PATH = _resolve(config.WEALTHFOLIO_DB_PATH)
 
 # ---------------------------------------------------------------------------
 # Expected structure for new ii CSV files
@@ -178,7 +180,7 @@ def yahoo_search(query: str) -> list[dict]:
     except Exception:
         return []
 
-def resolve_unknown_symbol(ii_symbol: str, sedol: str) -> str | None:
+def resolve_unknown_symbol(ii_symbol: str, sedol: str, description: str = "") -> str | None:
     """
     Interactively resolve an unknown ii symbol/SEDOL to a Wealthfolio symbol.
     Searches Yahoo Finance and prompts the user to confirm or enter manually.
@@ -186,6 +188,8 @@ def resolve_unknown_symbol(ii_symbol: str, sedol: str) -> str | None:
     Returns the resolved Wealthfolio symbol, or None to skip.
     """
     print(f"\n  UNKNOWN SYMBOL: ii symbol={ii_symbol!r} SEDOL={sedol!r}")
+    if description:
+        print(f"  Description: {description}")
 
     # Build list of queries to try
     queries = []
@@ -258,12 +262,12 @@ def resolve_unknown_symbol(ii_symbol: str, sedol: str) -> str | None:
     SYMBOL_LOOKUP[key] = wf_symbol
     return wf_symbol
 
-def map_symbol(symbol: str, sedol: str) -> str:
+def map_symbol(symbol: str, sedol: str, description: str = "") -> str:
     clean_symbol = symbol.strip()
     if clean_symbol and clean_symbol not in ("n/a", ""):
         if clean_symbol in SYMBOL_LOOKUP:
             return SYMBOL_LOOKUP[clean_symbol]
-        resolved = resolve_unknown_symbol(clean_symbol, sedol.strip())
+        resolved = resolve_unknown_symbol(clean_symbol, sedol.strip(), description)
         if resolved:
             return resolved
         return clean_symbol
@@ -271,7 +275,7 @@ def map_symbol(symbol: str, sedol: str) -> str:
     if clean_sedol and clean_sedol not in ("n/a", ""):
         if clean_sedol in SYMBOL_LOOKUP:
             return SYMBOL_LOOKUP[clean_sedol]
-        resolved = resolve_unknown_symbol("", clean_sedol)
+        resolved = resolve_unknown_symbol("", clean_sedol, description)
         if resolved:
             return resolved
         return clean_sedol
@@ -326,7 +330,7 @@ def classify(row: dict) -> dict | None:
     has_quantity = not is_empty(quantity_raw)
     price = parse_amount(price_raw)
 
-    symbol = map_symbol(symbol_raw, sedol_raw)
+    symbol = map_symbol(symbol_raw, sedol_raw, description)
 
     if description_lower.startswith("div "):
         return {
@@ -411,6 +415,44 @@ def classify(row: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 GUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+def fetch_wealthfolio_accounts() -> list[str]:
+    """Return account names from the Wealthfolio database, sorted alphabetically."""
+    try:
+        with sqlite3.connect(WEALTHFOLIO_DB_PATH) as connection:
+            result = connection.execute("SELECT name FROM accounts ORDER BY name")
+            return [row[0] for row in result.fetchall()]
+    except Exception as e:
+        print(f"  WARNING: Could not read Wealthfolio accounts: {e}")
+        return []
+
+def prompt_account_selection(filename: str) -> str | None:
+    """
+    Ask the user to choose an account from Wealthfolio when the filename
+    gives no account name. Auto-selects if there is only one account.
+    Returns the chosen account name (lowercased), or None on failure.
+    """
+    accounts = fetch_wealthfolio_accounts()
+    if not accounts:
+        print(f"  ERROR: No accounts found in Wealthfolio database and no account in filename.")
+        return None
+
+    if len(accounts) == 1:
+        account = accounts[0].lower()
+        print(f"  No account in filename — auto-selected the only Wealthfolio account: {accounts[0]}")
+        return account
+
+    print(f"  No account name found in filename: {filename!r}")
+    print(f"  Select the Wealthfolio account to import into:")
+    for index, name in enumerate(accounts, 1):
+        print(f"    {index}. {name}")
+    choice = input("  > ").strip()
+    if choice.isdigit() and 1 <= int(choice) <= len(accounts):
+        account = accounts[int(choice) - 1].lower()
+        print(f"  Using account: {accounts[int(choice) - 1]}")
+        return account
+    print(f"  ERROR: Invalid selection.")
+    return None
 
 def detect_account(filename: str) -> str:
     """Return the account name from the filename stem (lowercase, before any hyphen/underscore/digit)."""
@@ -497,8 +539,9 @@ def process_file(filepath: str) -> bool:
 
     account = detect_account(filename)
     if not account:
-        print(f"  ERROR: Could not derive account name from filename: {filename!r}")
-        return False
+        account = prompt_account_selection(filename)
+        if not account:
+            return False
 
     # Read file, stripping all BOM variants (ii stacks many BOMs throughout)
     try:
