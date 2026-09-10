@@ -458,8 +458,7 @@ def detect_account(filename: str) -> str:
     """Return the account name from the filename stem (lowercase, before any hyphen/underscore/digit)."""
     filename_stem = os.path.splitext(os.path.basename(filename))[0].lower()
     if GUID_PATTERN.match(filename_stem):
-        print(f"  WARNING: Filename looks like a GUID ({filename!r}). Account name will be meaningless.")
-        print(f"    Rename the file to start with your account name, e.g. 'myaccount-{filename_stem[:8]}.csv'")
+        return ""
     # Strip any trailing date, number, or separator suffix: isa-2026-05 → isa
     return re.split(r"[-_\d]", filename_stem)[0]
 
