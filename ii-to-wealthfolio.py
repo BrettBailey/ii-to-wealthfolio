@@ -484,11 +484,15 @@ def fetch_wealthfolio_accounts() -> list[str]:
         print(f"  WARNING: Could not read Wealthfolio accounts: {e}")
         return []
 
+class SkipFile(Exception):
+    """Raised when the user chooses not to import a file."""
+
 def prompt_account_selection(filename: str) -> str | None:
     """
     Ask the user to choose an account from Wealthfolio when the filename
     gives no account name. Auto-selects if there is only one account.
     Returns the chosen account name (lowercased), or None on failure.
+    Raises SkipFile if the user enters 'x' to skip the file.
     """
     accounts = fetch_wealthfolio_accounts()
     if not accounts:
@@ -504,7 +508,10 @@ def prompt_account_selection(filename: str) -> str | None:
     print(f"  Select the Wealthfolio account to import into:")
     for index, name in enumerate(accounts, 1):
         print(f"    {index}. {name}")
+    print(f"    x. Skip this file")
     choice = input("  > ").strip()
+    if choice.lower() == "x":
+        raise SkipFile()
     if choice.isdigit() and 1 <= int(choice) <= len(accounts):
         account = accounts[int(choice) - 1].lower()
         print(f"  Using account: {accounts[int(choice) - 1]}")
@@ -642,6 +649,7 @@ def process_file(filepath: str) -> bool:
     """
     Process a single ii download file.
     Returns True on success, False on validation failure.
+    Raises SkipFile if the user chooses not to import the file.
     """
     filename = os.path.basename(filepath)
     print(f"\n--- {filename} ---")
@@ -734,14 +742,19 @@ def main():
 
     success = 0
     failed = 0
+    skipped = 0
     for filepath in sorted(candidates):
-        if process_file(filepath):
-            success += 1
-        else:
-            failed += 1
+        try:
+            if process_file(filepath):
+                success += 1
+            else:
+                failed += 1
+        except SkipFile:
+            print(f"  Skipped. File left in input folder.")
+            skipped += 1
 
     print(f"\n{'='*60}")
-    print(f"Done. Success: {success}, Failed/Aborted: {failed}")
+    print(f"Done. Success: {success}, Skipped: {skipped}, Failed/Aborted: {failed}")
     if failed > 0:
         print("Review errors above before re-running.")
         sys.exit(1)
