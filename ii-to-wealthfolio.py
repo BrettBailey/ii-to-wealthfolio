@@ -34,7 +34,7 @@ import shutil
 import sqlite3
 import sys
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import config
 from pathlib import Path
@@ -302,10 +302,68 @@ def strip_bom(value: str) -> str:
     return value.replace("\ufeff", "")
 
 # ---------------------------------------------------------------------------
+# Same-day ordering
+#
+# Wealthfolio stores every activity at midnight, so it loses the order of
+# transactions that share a date: a dividend reinvestment can end up looking
+# like it happened after the sale that closed the position. Two rows that are
+# otherwise identical (same day, type and amount) also hash to the same
+# idempotency key, and the importer discards the second as a duplicate.
+#
+# ii exports newest-first, so within a single day the LAST row in the file is
+# the earliest event. Reversing each day's rows recovers the true order, which
+# we then stamp as a time of day. The sequence restarts at 00:00 on every new
+# date, so re-importing the same day produces byte-identical timestamps and
+# Wealthfolio's genuine duplicate detection still works.
+#
+# The gap is 10 minutes because Wealthfolio's activity list only displays the
+# time down to the minute: a smaller step would look identical on screen, and
+# same-minute transactions still collide as duplicates on import. The busiest
+# day seen so far is 5 transactions (ending 00:40), and it would take 145 in
+# one day to reach midnight, so there is ample room before a day overflows.
+# ---------------------------------------------------------------------------
+
+MINUTES_BETWEEN_TRANSACTIONS = 10
+
+def build_timestamp(trade_date: datetime, sequence_in_day: int) -> str:
+    """Return the Wealthfolio ISO timestamp for a transaction's position in its day."""
+    offset = timedelta(minutes=sequence_in_day * MINUTES_BETWEEN_TRANSACTIONS)
+    return (trade_date + offset).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+def assign_daily_sequence(rows: list[dict]) -> list[tuple[dict, int]]:
+    """
+    Pair each row with its chronological position within its own day.
+
+    ii lists a day's transactions newest-first, so each day's rows are reversed
+    to put the earliest first. Position numbering restarts for every date.
+    Rows keep their original file order in the returned list; only the numbers
+    reflect chronology.
+    """
+    rows_by_date: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        trade_date = row.get("Date", "").strip()
+        rows_by_date.setdefault(trade_date, []).append(index)
+
+    sequence_by_index: dict[int, int] = {}
+    for indexes in rows_by_date.values():
+        for position, index in enumerate(reversed(indexes)):
+            sequence_by_index[index] = position
+
+    return [(row, sequence_by_index[index]) for index, row in enumerate(rows)]
+
+# ---------------------------------------------------------------------------
 # Transaction classification (same logic as historical_convert.py)
 # ---------------------------------------------------------------------------
 
-def classify(row: dict) -> dict | None:
+def classify(row: dict, sequence_in_day: int = 0) -> dict | None:
+    """
+    Convert one ii row to a Wealthfolio activity.
+
+    sequence_in_day is the transaction's chronological position within its own
+    day (0 = earliest). It becomes the time-of-day on the output timestamp so
+    Wealthfolio preserves same-day ordering instead of collapsing everything to
+    midnight. See assign_daily_sequence() for how the position is derived.
+    """
     description = strip_bom(row.get("Description", "").strip())
     description_lower = description.lower()
 
@@ -319,7 +377,7 @@ def classify(row: dict) -> dict | None:
 
     try:
         trade_date = datetime.strptime(trade_date_raw, "%d/%m/%Y")
-        iso_date = trade_date.strftime("%Y-%m-%dT00:00:00.000Z")
+        iso_date = build_timestamp(trade_date, sequence_in_day)
     except ValueError:
         return None
 
@@ -478,6 +536,50 @@ def last_transaction_date(rows: list[dict]) -> str | None:
     return latest.strftime("%Y%m%d") if latest else None
 
 # ---------------------------------------------------------------------------
+# Duplicate disambiguation
+#
+# Wealthfolio builds an idempotency key per activity and rejects a second row
+# that hashes the same. The key does NOT include the timestamp (rows keep their
+# key when only the time changes), but it does include the description, so two
+# genuinely separate transactions that share a day, amount and description --
+# e.g. paying the same subscription twice on one day -- collide and the second
+# is silently discarded.
+#
+# Numbering the members of a colliding group makes each description unique, so
+# both rows import. Rows with nothing to clash against are left exactly as they
+# are: changing their description would change their key and re-import them as
+# new activities.
+# ---------------------------------------------------------------------------
+
+def disambiguate_duplicate_comments(activities: list[dict]) -> None:
+    """
+    Number the comments of activities that would otherwise be indistinguishable.
+
+    Activities that share a day, type, symbol, amount and comment are numbered
+    "<comment> 1", "<comment> 2", ... in order. Anything with no duplicate keeps
+    its original comment untouched. Modifies the activities in place.
+    """
+    def collision_key(activity: dict) -> tuple:
+        return (
+            activity["date"][:10],  # calendar day, ignoring the time we assigned
+            activity["activityType"],
+            activity["symbol"],
+            activity["quantity"],
+            activity["unitPrice"],
+            activity["amount"],
+            activity["comment"],
+        )
+
+    groups: dict[tuple, list[dict]] = {}
+    for activity in activities:
+        groups.setdefault(collision_key(activity), []).append(activity)
+
+    for group in groups.values():
+        if len(group) > 1:
+            for number, activity in enumerate(group, start=1):
+                activity["comment"] = f"{activity['comment']} {number}"
+
+# ---------------------------------------------------------------------------
 # Convert to Wealthfolio format
 # ---------------------------------------------------------------------------
 
@@ -491,12 +593,20 @@ def write_wealthfolio_csv(rows: list[dict], account: str, date_str: str) -> str:
     output_rows: list[dict] = []
     unclassified_rows: list[dict] = []
 
-    for row in rows:
-        result = classify(row)
+    for row, sequence_in_day in assign_daily_sequence(rows):
+        result = classify(row, sequence_in_day)
         if result is not None:
             output_rows.append(result)
         else:
             unclassified_rows.append(row)
+
+    # ii lists transactions newest-first. Sort oldest-first so the file reads in
+    # the same direction as the timestamps ascend. The ISO timestamps are
+    # fixed-width, so sorting them as plain strings is already chronological.
+    output_rows.sort(key=lambda activity: activity["date"])
+
+    # After sorting, so a group is numbered earliest-first.
+    disambiguate_duplicate_comments(output_rows)
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_path = os.path.join(OUTPUT_DIR, f"{date_str}-{account}.csv")
